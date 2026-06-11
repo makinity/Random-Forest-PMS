@@ -1,7 +1,9 @@
-fastapi
-uvicorn
-scikit-learn
-pandas
-joblib
-shap
-python-dotenv
+fastapi==0.111.0
+uvicorn==0.29.0
+scikit-learn==1.4.2
+pandas==2.2.2
+joblib==1.4.2
+python-dotenv==1.0.1
+SQLAlchemy==2.0.30
+PyMySQL==1.1.1
+pydantic-settings==2.2.1
