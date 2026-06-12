@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git push *)",
+      "Bash(curl -s -X POST http://127.0.0.1:8000/suggest-employees -H \"Content-Type: application/json\" -d \"{\\\\\"uwp_success_indicator_id\\\\\": 1, \\\\\"performance_period_id\\\\\": 1}\")"
+    ]
+  }
+}

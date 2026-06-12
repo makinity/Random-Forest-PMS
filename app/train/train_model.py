@@ -42,10 +42,18 @@ def _build_pipeline(X: pd.DataFrame) -> Pipeline:
     ])
 
 
-def _derive_fields(predictions, probabilities):
+def _derive_fields(predictions, probabilities, classes):
     """Mirrors exact Colab derivation logic."""
     feasibility_labels = predictions
-    feasibility_probs = probabilities.max(axis=1).round(4)
+
+    # probability of the 'achievable' class — this is the true success probability
+    if "achievable" in classes:
+        achievable_idx = list(classes).index("achievable")
+        achievable_probs = probabilities[:, achievable_idx]
+    else:
+        achievable_probs = probabilities.max(axis=1)
+
+    feasibility_probs = achievable_probs.round(4)
 
     risk_level = pd.Series(feasibility_labels).map({
         "achievable": "Low",
@@ -85,7 +93,7 @@ def run_training(db: Session) -> dict:
     all_probabilities = pipeline.predict_proba(X)
 
     feasibility_labels, feasibility_probs, risk_levels, fit_scores, fit_labels, warnings = \
-        _derive_fields(all_predictions, all_probabilities)
+        _derive_fields(all_predictions, all_probabilities, pipeline.classes_)
 
     pred_df = pd.DataFrame({
         "employee_id":              df["employee_id"],
