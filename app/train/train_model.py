@@ -55,11 +55,9 @@ def _derive_fields(predictions, probabilities, classes):
 
     feasibility_probs = achievable_probs.round(4)
 
-    risk_level = pd.Series(feasibility_labels).map({
-        "achievable": "Low",
-        "at_risk": "Medium",
-        "unrealistic": "High",
-    })
+    risk_level = pd.Series(feasibility_probs).map(
+        lambda p: "Low" if p >= 0.75 else "Medium" if p >= 0.30 else "High"
+    )
 
     fit_score = (feasibility_probs * 100).round(1)
 
