@@ -162,3 +162,116 @@ def run_training(db: Session) -> dict:
         "indicators_upserted": upsert_count,
         "model_version": MODEL_VERSION,
     }
+
+
+
+def train_from_dataframe(df: pd.DataFrame, target_column: str, log_id: int, source_type: str = "sql") -> None:
+    """
+    Background training entry point for /ml/train-sql and /ml/train-csv.
+    Opens its own DB session so it is safe to run after the request session closes.
+    """
+    from app.db import SessionLocal  # local import avoids circular import at module load
+
+    db: Session = SessionLocal()
+    try:
+        drop = [c for c in _DROP_COLS + [target_column] if c in df.columns]
+        X = df.drop(columns=drop, errors="ignore")
+        y = df[target_column]
+
+        pipeline = _build_pipeline(X)
+        pipeline.fit(X, y)
+
+        all_predictions = pipeline.predict(X)
+        all_probabilities = pipeline.predict_proba(X)
+
+        feasibility_labels, feasibility_probs, risk_levels, fit_scores, fit_labels, warnings = \
+            _derive_fields(all_predictions, all_probabilities, pipeline.classes_)
+
+        pred_df = pd.DataFrame({
+            "employee_id":              df["employee_id"],
+            "uwp_success_indicator_id": df["uwp_success_indicator_id"],
+            "performance_period_id":    df["performance_period_id"],
+            "feasibility_label":        feasibility_labels,
+            "feasibility_probability":  feasibility_probs,
+            "risk_level":               risk_levels,
+            "fit_score":                fit_scores,
+            "fit_label":                fit_labels,
+            "warning":                  warnings,
+        })
+
+        for indicator_id, group in pred_df.groupby("uwp_success_indicator_id"):
+            recs = (
+                group.sort_values("fit_score", ascending=False)
+                .drop_duplicates(subset=["employee_id"], keep="first")[
+                    ["employee_id", "fit_score", "fit_label",
+                     "feasibility_label", "feasibility_probability",
+                     "risk_level", "warning"]
+                ]
+                .assign(warning=lambda d: d["warning"].astype(bool))
+                .to_dict("records")
+            )
+            top = recs[0]
+            period_id = int(group["performance_period_id"].iloc[0]) \
+                if pd.notna(group["performance_period_id"].iloc[0]) else None
+
+            db.execute(text("""
+                INSERT INTO ml_kpi_predictions
+                  (uwp_success_indicator_id, performance_period_id,
+                   feasibility_label, feasibility_probability, risk_level,
+                   recommendations, model_version, generated_at)
+                VALUES
+                  (:ind_id, :per_id, :f_label, :f_prob, :risk, :recs, :ver, NOW())
+                ON DUPLICATE KEY UPDATE
+                  feasibility_label       = VALUES(feasibility_label),
+                  feasibility_probability = VALUES(feasibility_probability),
+                  risk_level              = VALUES(risk_level),
+                  recommendations         = VALUES(recommendations),
+                  model_version           = VALUES(model_version),
+                  generated_at            = NOW()
+            """), {
+                "ind_id": int(indicator_id),
+                "per_id": period_id,
+                "f_label": top["feasibility_label"],
+                "f_prob":  float(top["feasibility_probability"]),
+                "risk":    top["risk_level"],
+                "recs":    json.dumps(recs),
+                "ver":     MODEL_VERSION,
+            })
+
+        save_model(pipeline, path="models/random_forest.pkl")
+
+        if source_type == "csv":
+            from app.db import engine as db_engine
+            snapshot_cols = [c for c in df.columns if c != "feasibility_label"]
+            insert_df = df[snapshot_cols].copy()
+            for col in ("created_at", "updated_at"):
+                if col in insert_df.columns:
+                    insert_df[col] = pd.to_datetime(insert_df[col], errors="coerce")
+            with db_engine.begin() as conn:
+                conn.execute(text("TRUNCATE TABLE employee_performance_snapshots"))
+                insert_df.to_sql(
+                    "employee_performance_snapshots",
+                    con=conn,
+                    if_exists="append",
+                    index=False,
+                    method="multi",
+                    chunksize=500,
+                )
+
+        db.execute(text("""
+            UPDATE ml_model_logs
+            SET status = 'success', row_count = :rows, trained_at = NOW(), updated_at = NOW()
+            WHERE id = :log_id
+        """), {"rows": len(df), "log_id": log_id})
+        db.commit()
+
+    except Exception as exc:
+        db.rollback()
+        db.execute(text("""
+            UPDATE ml_model_logs
+            SET status = 'failed', error_message = :err, trained_at = NOW(), updated_at = NOW()
+            WHERE id = :log_id
+        """), {"err": str(exc)[:1000], "log_id": log_id})
+        db.commit()
+    finally:
+        db.close()

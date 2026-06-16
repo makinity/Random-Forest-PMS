@@ -16,9 +16,9 @@ def get_model():
     return _model
 
 
-def save_model(pipeline):
+def save_model(pipeline, path: str = None):
     global _model
-    joblib.dump(pipeline, settings.MODEL_PATH)
+    joblib.dump(pipeline, path or settings.MODEL_PATH)
     _model = pipeline
 
 
