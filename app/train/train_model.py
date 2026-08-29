@@ -199,54 +199,66 @@ def train_from_dataframe(df: pd.DataFrame, target_column: str, log_id: int, sour
             "warning":                  warnings,
         })
 
-        for indicator_id, group in pred_df.groupby("uwp_success_indicator_id"):
-            recs = (
-                group.sort_values("fit_score", ascending=False)
-                .drop_duplicates(subset=["employee_id"], keep="first")[
-                    ["employee_id", "fit_score", "fit_label",
-                     "feasibility_label", "feasibility_probability",
-                     "risk_level", "warning"]
-                ]
-                .assign(warning=lambda d: d["warning"].astype(bool))
-                .to_dict("records")
-            )
-            top = recs[0]
-            period_id = int(group["performance_period_id"].iloc[0]) \
-                if pd.notna(group["performance_period_id"].iloc[0]) else None
+        # CSV training is purely for building the model — the indicator/period/employee
+        # IDs in the CSV are synthetic and won't match live FK constraints.
+        # Skip the ml_kpi_predictions upsert entirely for CSV source.
+        if source_type != "csv":
+            for indicator_id, group in pred_df.groupby("uwp_success_indicator_id"):
+                recs = (
+                    group.sort_values("fit_score", ascending=False)
+                    .drop_duplicates(subset=["employee_id"], keep="first")[
+                        ["employee_id", "fit_score", "fit_label",
+                         "feasibility_label", "feasibility_probability",
+                         "risk_level", "warning"]
+                    ]
+                    .assign(warning=lambda d: d["warning"].astype(bool))
+                    .to_dict("records")
+                )
+                top = recs[0]
+                period_id = int(group["performance_period_id"].iloc[0]) \
+                    if pd.notna(group["performance_period_id"].iloc[0]) else None
 
-            db.execute(text("""
-                INSERT INTO ml_kpi_predictions
-                  (uwp_success_indicator_id, performance_period_id,
-                   feasibility_label, feasibility_probability, risk_level,
-                   recommendations, model_version, generated_at)
-                VALUES
-                  (:ind_id, :per_id, :f_label, :f_prob, :risk, :recs, :ver, NOW())
-                ON DUPLICATE KEY UPDATE
-                  feasibility_label       = VALUES(feasibility_label),
-                  feasibility_probability = VALUES(feasibility_probability),
-                  risk_level              = VALUES(risk_level),
-                  recommendations         = VALUES(recommendations),
-                  model_version           = VALUES(model_version),
-                  generated_at            = NOW()
-            """), {
-                "ind_id": int(indicator_id),
-                "per_id": period_id,
-                "f_label": top["feasibility_label"],
-                "f_prob":  float(top["feasibility_probability"]),
-                "risk":    top["risk_level"],
-                "recs":    json.dumps(recs),
-                "ver":     MODEL_VERSION,
-            })
+                db.execute(text("""
+                    INSERT INTO ml_kpi_predictions
+                      (uwp_success_indicator_id, performance_period_id,
+                       feasibility_label, feasibility_probability, risk_level,
+                       recommendations, model_version, generated_at)
+                    VALUES
+                      (:ind_id, :per_id, :f_label, :f_prob, :risk, :recs, :ver, NOW())
+                    ON DUPLICATE KEY UPDATE
+                      feasibility_label       = VALUES(feasibility_label),
+                      feasibility_probability = VALUES(feasibility_probability),
+                      risk_level              = VALUES(risk_level),
+                      recommendations         = VALUES(recommendations),
+                      model_version           = VALUES(model_version),
+                      generated_at            = NOW()
+                """), {
+                    "ind_id": int(indicator_id),
+                    "per_id": period_id,
+                    "f_label": top["feasibility_label"],
+                    "f_prob":  float(top["feasibility_probability"]),
+                    "risk":    top["risk_level"],
+                    "recs":    json.dumps(recs),
+                    "ver":     MODEL_VERSION,
+                })
 
-        save_model(pipeline, path="models/random_forest.pkl")
+        save_model(pipeline)  # saves to settings.MODEL_PATH (random_forest_kpi_model.pkl)
 
         if source_type == "csv":
             from app.db import engine as db_engine
             snapshot_cols = [c for c in df.columns if c != "feasibility_label"]
             insert_df = df[snapshot_cols].copy()
+
+            # Null out FK columns — CSV rows are synthetic/historical and
+            # won't have valid user/period IDs in the live DB.
+            for fk_col in ("employee_id", "performance_period_id", "ipcr_id", "uwp_success_indicator_id"):
+                if fk_col in insert_df.columns:
+                    insert_df[fk_col] = None
+
             for col in ("created_at", "updated_at"):
                 if col in insert_df.columns:
                     insert_df[col] = pd.to_datetime(insert_df[col], errors="coerce")
+
             with db_engine.begin() as conn:
                 conn.execute(text("TRUNCATE TABLE employee_performance_snapshots"))
                 insert_df.to_sql(
